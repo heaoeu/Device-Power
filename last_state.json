@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "readings": {
+    "A8A5:2255": {
+      "level": 41,
+      "charging": false,
+      "source": "AULA 2.4G 厂商协议（AA 30）",
+      "detail": "2.4G dongle battery report",
+      "timestamp": 1795334749.365405,
+      "name": "YJX-CHIP"
+    },
+    "0C45:FEFE": {
+      "level": 38,
+      "charging": null,
+      "source": "AULA 状态帧（55 10 18）",
+      "detail": "status=0x02, battery=byte 25",
+      "timestamp": 1795334749.8756528,
+      "name": "AULA F87 Pro V2 键盘"
+    }
+  }
+}

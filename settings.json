@@ -1,0 +1,28 @@
+{
+  "refresh_seconds": 600,
+  "show_tray_icon": false,
+  "show_taskbar_strip": true,
+  "tray_devices": [
+    "mouse",
+    "keyboard"
+  ],
+  "targets": [
+    {
+      "id": "mouse",
+      "kind": "mouse",
+      "name": "无线鼠标",
+      "vid": "A8A5",
+      "pid": "2255",
+      "profile": "kysona"
+    },
+    {
+      "id": "keyboard",
+      "kind": "keyboard",
+      "name": "AULA F87 Pro V2 键盘",
+      "vid": "0C45",
+      "pid": "FEFE",
+      "profile": "sonix"
+    }
+  ],
+  "calibrations": {}
+}
