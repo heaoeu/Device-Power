@@ -17,6 +17,9 @@ from .providers import Target
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 SETTINGS_PATH = PROJECT_DIR / "settings.json"
+# Window/taskbar/shortcut icon.  It is a file, not something drawn at runtime,
+# because Explorer and .lnk files need a real .ico on disk.
+APP_ICON_PATH = PROJECT_DIR / "wbtool" / "app.ico"
 DEFAULT_REFRESH_SECONDS = 60
 MIN_REFRESH_SECONDS = 30
 MAX_REFRESH_SECONDS = 30 * 60
@@ -25,7 +28,11 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "refresh_seconds": DEFAULT_REFRESH_SECONDS,
     "show_tray_icon": True,
     "show_taskbar_strip": True,
+    "hide_to_tray": True,
+    "discovered": [],
+    "removed": [],
     "tray_devices": ["mouse", "keyboard"],
+    "taskbar_devices": ["mouse", "keyboard"],
     "targets": [
         {
             "id": "mouse",
@@ -76,6 +83,15 @@ def _to_hex_int(value: Any, default: int = 0) -> int:
     return default
 
 
+def _unique_ids(values) -> list[str]:
+    out: list[str] = []
+    for item in values:
+        text = str(item).strip()
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
 def normalize_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
     data = dict(DEFAULT_SETTINGS)
     if isinstance(raw, dict):
@@ -110,12 +126,56 @@ def normalize_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
         targets = json.loads(json.dumps(DEFAULT_SETTINGS["targets"]))
     data["targets"] = targets
 
+    # Device ids, not kinds: discovered devices ("HID-XXXX-YYYY") can be shown
+    # on either surface too, so the lists must keep any non-empty string.
     raw_devices = data.get("tray_devices")
     if isinstance(raw_devices, list):
-        wanted = {str(item) for item in raw_devices}
-        data["tray_devices"] = [kind for kind in ("mouse", "keyboard") if kind in wanted]
+        data["tray_devices"] = _unique_ids(raw_devices)
     else:
         data["tray_devices"] = ["mouse", "keyboard"]
+    # Taskbar cells are chosen per device too.  Settings files written before
+    # the per-device switches existed only had one list, which drove both
+    # surfaces; keep that behaviour when the key is missing.
+    raw_strip = data.get("taskbar_devices")
+    if isinstance(raw_strip, list):
+        data["taskbar_devices"] = _unique_ids(raw_strip)
+    else:
+        data["taskbar_devices"] = list(data["tray_devices"])
+
+    raw_discovered = data.get("discovered")
+    discovered: list[dict[str, Any]] = []
+    if isinstance(raw_discovered, list):
+        seen: set[str] = set()
+        for item in raw_discovered:
+            if not isinstance(item, dict):
+                continue
+            vid = _to_hex_int(item.get("vid"), -1)
+            pid = _to_hex_int(item.get("pid"), -1)
+            if vid < 0 or pid < 0:
+                continue
+            device_id = str(item.get("id") or f"HID-{vid:04X}-{pid:04X}")
+            if device_id in seen:
+                continue
+            seen.add(device_id)
+            discovered.append(
+                {
+                    "id": device_id,
+                    "kind": str(item.get("kind") or "device"),
+                    "name": str(item.get("name") or f"外设 {vid:04X}:{pid:04X}"),
+                    "vid": f"{vid:04X}",
+                    "pid": f"{pid:04X}",
+                }
+            )
+    data["discovered"] = discovered
+    data["hide_to_tray"] = bool(data.get("hide_to_tray", True))
+    raw_removed = data.get("removed")
+    removed: list[str] = []
+    if isinstance(raw_removed, list):
+        for item in raw_removed:
+            key = str(item).strip().upper()
+            if key and key not in removed:
+                removed.append(key)
+    data["removed"] = removed
 
     cals = data.get("calibrations")
     if isinstance(cals, dict):
@@ -204,3 +264,23 @@ def project_display_path() -> str:
 
 def is_frozen() -> bool:
     return bool(getattr(sys, "frozen", False))
+
+
+def discovered_from_settings(data: dict[str, Any]) -> list[Target]:
+    """Devices found by a scan, kept across restarts so their cards survive."""
+    out: list[Target] = []
+    for item in data.get("discovered", []):
+        vid = _to_hex_int(item.get("vid"), 0)
+        pid = _to_hex_int(item.get("pid"), 0)
+        if vid <= 0 or pid <= 0:
+            continue
+        out.append(
+            Target(
+                id=str(item.get("id") or f"HID-{vid:04X}-{pid:04X}"),
+                name=str(item.get("name") or f"外设 {vid:04X}:{pid:04X}"),
+                kind=str(item.get("kind") or "device"),
+                vid=vid,
+                pid=pid,
+            )
+        )
+    return out

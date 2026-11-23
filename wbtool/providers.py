@@ -859,33 +859,41 @@ def read_target(target: Target, interfaces: Iterable[HidInterface], calibrations
     # VID:PID and may be used against any of its vendor interfaces.
     cal = calibrations.get(target.key) or calibrations.get(target.key.upper()) or {}
 
+    # 1) The generic HID battery field comes first, on every interface of the
+    #    device.  A newly discovered receiver may expose both a standard field
+    #    and a vendor protocol, and the standard query is cheaper, needs no
+    #    VID/PID knowledge and is the one the HID spec defines.
     for iface in candidates:
-        # A cached path is tried first, but the full chain still runs if it fails.
-        standard_caps = battery_value_caps(iface, HidP_Feature)
-        if standard_caps:
-            attempts += 1
-            try:
-                reading = read_standard_feature(iface)
-            except Exception as exc:
-                reading = None
-                last_error = f"标准 Feature 读取失败: {exc}"
-            if reading and reading.has_level:
-                return TargetResult(target, reading, attempts=attempts, path=iface.path)
-            if reading and reading.detail:
-                last_error = reading.detail
+        if not battery_value_caps(iface, HidP_Feature):
+            continue
+        attempts += 1
+        try:
+            reading = read_standard_feature(iface)
+        except Exception as exc:
+            reading = None
+            last_error = f"标准 Feature 读取失败: {exc}"
+        if reading and reading.has_level:
+            return TargetResult(target, reading, attempts=attempts, path=iface.path)
+        if reading and reading.detail:
+            last_error = reading.detail
 
-        if battery_value_caps(iface, HidP_Input):
-            attempts += 1
-            try:
-                reading = read_standard_input(iface)
-            except Exception as exc:
-                reading = None
-                last_error = f"标准 Input 读取失败: {exc}"
-            if reading and reading.has_level:
-                return TargetResult(target, reading, attempts=attempts, path=iface.path)
-            if reading and reading.detail:
-                last_error = reading.detail
+    for iface in candidates:
+        if not battery_value_caps(iface, HidP_Input):
+            continue
+        attempts += 1
+        try:
+            reading = read_standard_input(iface)
+        except Exception as exc:
+            reading = None
+            last_error = f"标准 Input 读取失败: {exc}"
+        if reading and reading.has_level:
+            return TargetResult(target, reading, attempts=attempts, path=iface.path)
+        if reading and reading.detail:
+            last_error = reading.detail
 
+    # 2) No answer from the generic field: fall back to the vendor protocols
+    #    that were already adapted for this device (VID/PID or profile).
+    for iface in candidates:
         for provider in _vendor_providers(iface, target):
             attempts += 1
             try:
@@ -903,7 +911,9 @@ def read_target(target: Target, interfaces: Iterable[HidInterface], calibrations
                     # keep the text for the panel but keep looking for a level.
                     last_error = f"{reading.source}: {reading.detail}"
 
-        if cal:
+    # 3) Last resort: the manual calibration table.
+    if cal:
+        for iface in candidates:
             attempts += 1
             try:
                 reading = read_calibration(iface, cal)

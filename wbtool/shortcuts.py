@@ -24,6 +24,14 @@ CLSCTX_INPROC_SERVER = 1
 COINIT_APARTMENTTHREADED = 2
 STGM_READ = 0
 
+# The portable launcher: a fixed-position copy under %LOCALAPPDATA%.  Shortcuts
+# point at that copy, never at the project directory, so moving the project
+# cannot break autostart.
+LAUNCHER_NAME = "电量托盘启动器.pyw"
+# A copy of wbtool/app.ico lives next to the launcher so shortcuts keep a stable
+# icon even when the project folder is moved.
+ICON_NAME = "电量托盘.ico"
+
 # IShellLinkW vtable indices (IUnknown 0-2, then IShellLinkW methods)
 SL_GETPATH = 3
 SL_GETWORKINGDIRECTORY = 8
@@ -232,6 +240,17 @@ def _approved_state(raw: bytes | None) -> str:
     return "unknown"
 
 
+def script_from_arguments(arguments: str) -> str:
+    """Return the script path encoded in a shortcut's Arguments string."""
+    text = (arguments or "").strip()
+    if not text:
+        return ""
+    if text.startswith('"'):
+        end = text.find('"', 1)
+        return text[1:end] if end != -1 else text[1:]
+    return text.split()[0]
+
+
 def startup_state() -> dict:
     lnk = startup_shortcut_path()
     raw = _read_startup_approved(lnk.name)
@@ -239,8 +258,10 @@ def startup_state() -> dict:
     exists = lnk.is_file()
     target_ok = False
     args_ok = False
+    path_ok = False
     target = ""
     arguments = ""
+    script = ""
     read_error = ""
     if exists:
         try:
@@ -249,7 +270,11 @@ def startup_state() -> dict:
             arguments = info.get("arguments", "")
             target_ok = os.path.normcase(os.path.basename(target)) == "pythonw.exe"
             # The script path can be quoted or unquoted in Arguments.
-            args_ok = "my_devices.py" in arguments and "--tray" in arguments
+            script = script_from_arguments(arguments)
+            args_ok = os.path.normcase(os.path.basename(script)) == os.path.normcase(LAUNCHER_NAME)
+            # A shortcut survives a folder move while its embedded path does
+            # not: the .lnk still parses fine, but nothing starts at logon.
+            path_ok = bool(script) and os.path.isfile(script)
         except Exception as exc:
             read_error = str(exc)
     enabled = exists and approved != "disabled"
@@ -261,8 +286,10 @@ def startup_state() -> dict:
         "enabled": enabled,
         "target": target,
         "arguments": arguments,
+        "script": script,
         "target_ok": target_ok,
         "args_ok": args_ok,
+        "path_ok": path_ok,
         "read_error": read_error,
         "task_manager_visible": exists,
     }
@@ -271,23 +298,37 @@ def startup_state() -> dict:
 def set_startup_enabled(enabled: bool, project_dir: str, script_path: str, description: str = "电量托盘") -> dict:
     """Explicit user action: create/disable the Startup-folder shortcut.
 
+    ``script_path`` is the portable launcher copy under %LOCALAPPDATA%, never a
+    path inside the project, so the shortcut stays valid across project moves.
     Disabling keeps the .lnk (so Task Manager still lists it as disabled) and
     writes the same StartupApproved 03 00 ... marker Explorer/Task Manager use.
-    Nothing in the running tray ever calls this automatically.
     """
     from .win32 import pythonw_path
 
     lnk = startup_shortcut_path()
     lnk.parent.mkdir(parents=True, exist_ok=True)
-    args = f'"{script_path}" --tray'
-    if not lnk.is_file() or not startup_state().get("target_ok") or not startup_state().get("args_ok"):
+    args = f'"{script_path}"'
+    icon = Path(script_path).with_name(ICON_NAME)
+    icon_location = str(icon) if icon.is_file() else pythonw_path()
+    state = startup_state()
+    # path_ok matters: after the project folder is moved (or renamed), an old
+    # shortcut still parses, so a target/args-only check would leave it broken.
+    # Recreate it whenever our own .ico exists too, so a shortcut made by an
+    # older version stops showing the stock Python icon.
+    if (
+        not lnk.is_file()
+        or not state.get("target_ok")
+        or not state.get("args_ok")
+        or not state.get("path_ok")
+        or icon.is_file()
+    ):
         create_shortcut(
             lnk,
             pythonw_path(),
             arguments=args,
             working_directory=project_dir,
             description=description,
-            icon_location=pythonw_path(),
+            icon_location=icon_location,
         )
     if enabled:
         _write_startup_approved(lnk.name, b"\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")
@@ -332,21 +373,41 @@ def _same_target(link: str, target: str) -> bool:
         return False
 
 
+def _is_reparse_dir(path: Path) -> bool:
+    import stat as _stat
+
+    try:
+        info = os.lstat(str(path))
+    except OSError:
+        return False
+    if not _stat.S_ISDIR(info.st_mode):
+        return False
+    return bool(getattr(info, "st_file_attributes", 0) & 0x400)
+
+
 def ensure_directory_link(link: Path, target: Path) -> str:
     """Create Desktop -> project directory link.
 
     Prefer a real symlink; on Windows without Developer Mode/admin privilege
     fall back to a junction (mklink /J), which also does not copy anything.
+    A link left over from an older project location is replaced.
     """
     link = Path(link)
     target = Path(target)
-    if link.exists() or link.is_symlink():
+    if link.exists() or link.is_symlink() or _is_reparse_dir(link):
         if _same_target(str(link), str(target)):
             try:
                 return "symlink" if link.is_symlink() else "junction"
             except OSError:
                 return "junction"
-        raise FileExistsError(f"桌面已存在同名项目，但它不是指向本项目的链接：{link}")
+        if _is_reparse_dir(link) or link.is_symlink():
+            # Stale link (project moved): drop the reparse point, never the data.
+            try:
+                os.rmdir(str(link)) if _is_reparse_dir(link) else link.unlink()
+            except OSError:
+                pass
+        else:
+            raise FileExistsError(f"桌面已存在同名项目，但它不是指向本项目的链接：{link}")
     parent = link.parent
     parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -365,32 +426,6 @@ def ensure_directory_link(link: Path, target: Path) -> str:
     if not ok or not _same_target(str(link), str(target)):
         raise OSError(f"创建目录链接失败：{output.strip() or 'mklink /J 失败'}")
     return "junction"
-
-
-def ensure_file_link(link: Path, target: Path) -> str:
-    """Create Desktop -> launcher file link; symlink, then hardlink fallback."""
-    link = Path(link)
-    target = Path(target)
-    if link.exists() or link.is_symlink():
-        if _same_target(str(link), str(target)):
-            return "symlink" if link.is_symlink() else "hardlink"
-        raise FileExistsError(f"桌面已存在同名文件，但它不是指向启动脚本的链接：{link}")
-    link.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        os.symlink(str(target), str(link))
-        return "symlink"
-    except OSError:
-        pass
-    try:
-        if link.is_symlink():
-            link.unlink()
-    except OSError:
-        pass
-    try:
-        os.link(str(target), str(link))
-        return "hardlink"
-    except OSError as exc:
-        raise OSError(f"创建文件链接失败（符号链接与硬链接均失败）：{exc}") from exc
 
 
 def link_kind(path: Path) -> str:

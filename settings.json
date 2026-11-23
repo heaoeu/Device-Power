@@ -1,20 +1,30 @@
 {
-  "refresh_seconds": 600,
-  "show_tray_icon": false,
+  "refresh_seconds": 1800,
+  "show_tray_icon": true,
   "show_taskbar_strip": true,
+  "hide_to_tray": true,
+  "discovered": [
+    {
+      "id": "HID-A8A5-2255",
+      "kind": "mouse",
+      "name": "USB Receiver",
+      "vid": "A8A5",
+      "pid": "2255"
+    }
+  ],
+  "removed": [
+    "0C45:FEFE",
+    "A8A5:2255"
+  ],
   "tray_devices": [
-    "mouse",
+    "HID-A8A5-2255",
+    "keyboard"
+  ],
+  "taskbar_devices": [
+    "HID-A8A5-2255",
     "keyboard"
   ],
   "targets": [
-    {
-      "id": "mouse",
-      "kind": "mouse",
-      "name": "无线鼠标",
-      "vid": "A8A5",
-      "pid": "2255",
-      "profile": "kysona"
-    },
     {
       "id": "keyboard",
       "kind": "keyboard",

@@ -236,6 +236,77 @@ def pythonw_path() -> str:
     return exe
 
 
+def toplevel_hwnd(child_hwnd: int) -> int:
+    """Return the wrapper HWND of a Tk window (the one with the taskbar button)."""
+    try:
+        user32.GetParent.restype = wintypes.HWND
+        user32.GetParent.argtypes = [wintypes.HWND]
+        parent = user32.GetParent(wintypes.HWND(child_hwnd))
+        return int(parent or 0) or int(child_hwnd)
+    except Exception:
+        return int(child_hwnd)
+
+
+def foreground_window(hwnd: int) -> bool:
+    """Raise a top-level window above other applications and focus it.
+
+    Tk's ``lift``/``focus_force`` only reorder windows inside our own process,
+    so a panel opened from the taskbar strip or the tray would otherwise stay
+    behind the active application.  When the click landed on a child of the
+    taskbar the foreground lock may still reject SetForegroundWindow, hence the
+    AttachThreadInput fallback.
+    """
+    if not hwnd:
+        return False
+    try:
+        user32.SetWindowPos.restype = wintypes.BOOL
+        user32.SetWindowPos.argtypes = [
+            wintypes.HWND,
+            wintypes.HWND,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.UINT,
+        ]
+        user32.SetForegroundWindow.restype = wintypes.BOOL
+        user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        user32.GetForegroundWindow.argtypes = []
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        user32.GetWindowThreadProcessId.argtypes = [
+            wintypes.HWND, ctypes.POINTER(wintypes.DWORD)
+        ]
+        user32.AttachThreadInput.restype = wintypes.BOOL
+        user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+        user32.SetFocus.restype = wintypes.HWND
+        user32.SetFocus.argtypes = [wintypes.HWND]
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+        kernel32.GetCurrentThreadId.argtypes = []
+
+        top = wintypes.HWND(hwnd)
+        # HWND_TOP without moving/resizing; activate through SetForegroundWindow.
+        user32.SetWindowPos(top, None, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)
+        if user32.SetForegroundWindow(top):
+            return True
+        # The foreground lock can reject a click that landed on a child of the
+        # taskbar; attaching to the foreground thread's input queue lifts it.
+        foreground = int(user32.GetForegroundWindow() or 0)
+        current = int(kernel32.GetCurrentThreadId())
+        other = int(user32.GetWindowThreadProcessId(foreground, None)) if foreground else 0
+        if other and other != current and user32.AttachThreadInput(current, other, True):
+            try:
+                user32.SetForegroundWindow(top)
+                user32.SetFocus(top)
+            finally:
+                user32.AttachThreadInput(current, other, False)
+            return True
+        return False
+    except Exception:
+        return False
+
+
 def loword(value: int) -> int:
     return int(value) & 0xFFFF
 

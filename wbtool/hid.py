@@ -37,6 +37,7 @@ from .win32 import (
 
 setupapi = ctypes.WinDLL("setupapi", use_last_error=True)
 hid = ctypes.WinDLL("hid", use_last_error=True)
+cfgmgr32 = ctypes.WinDLL("cfgmgr32", use_last_error=True)
 
 DIGCF_PRESENT = 0x02
 DIGCF_DEVICEINTERFACE = 0x10
@@ -77,6 +78,14 @@ BATTERY_USAGE_LABELS = {
     (0x0085, 0x0065): "Battery System 0x0085/0x0065 Battery Level",
     (0x0085, 0x0066): "Battery System 0x0085/0x0066 Relative State of Charge",
 }
+
+# Transport labels shown in the UI.  A USB link is reported as 2.4G only when
+# the receiver advertises itself, so a plain cable never poses as a dongle.
+TRANSPORT_2G4 = "2.4G"
+TRANSPORT_BLUETOOTH = "蓝牙"
+TRANSPORT_WIRED = "有线"
+
+WIRELESS_MARKERS = ("dongle", "receiver", "2.4g", "wireless", "接收器")
 
 
 class HidError(OSError):
@@ -234,6 +243,20 @@ setupapi.SetupDiGetDeviceInstanceIdW.argtypes = [
 setupapi.SetupDiDestroyDeviceInfoList.restype = wintypes.BOOL
 setupapi.SetupDiDestroyDeviceInfoList.argtypes = [wintypes.HANDLE]
 
+cfgmgr32.CM_Get_Parent.restype = wintypes.DWORD
+cfgmgr32.CM_Get_Parent.argtypes = [
+    ctypes.POINTER(wintypes.DWORD),
+    wintypes.DWORD,
+    wintypes.ULONG,
+]
+cfgmgr32.CM_Get_Device_IDW.restype = wintypes.DWORD
+cfgmgr32.CM_Get_Device_IDW.argtypes = [
+    wintypes.DWORD,
+    wintypes.LPWSTR,
+    wintypes.ULONG,
+    wintypes.ULONG,
+]
+
 hid.HidD_GetAttributes.restype = wintypes.BOOL
 hid.HidD_GetAttributes.argtypes = [wintypes.HANDLE, ctypes.POINTER(HIDD_ATTRIBUTES)]
 hid.HidD_GetPreparsedData.restype = wintypes.BOOL
@@ -305,6 +328,7 @@ class ValueCap:
 class HidInterface:
     path: str
     instance_id: str = ""
+    enumerator: str = ""
     vid: int = 0
     pid: int = 0
     version: int = 0
@@ -334,6 +358,28 @@ class HidInterface:
     @property
     def is_vendor(self) -> bool:
         return self.usage_page >= 0xFF00
+
+    @property
+    def transport(self) -> str:
+        """How the device is attached: ``2.4G``, ``蓝牙``, ``有线`` or ``""``.
+
+        The HID node itself is always a child of ``HID``; the enumerator of its
+        ancestor tells the truth: ``USB\\VID_...`` is a USB link, while
+        ``BTHENUM`` / ``BTHLE`` come from Bluetooth.  A USB link is a 2.4G
+        dongle when the receiver says so (``Dongle`` / ``Receiver`` / ``2.4G``
+        in the product or manufacturer string), otherwise it is a cable.
+        """
+        enumerator = (self.enumerator or "").upper()
+        if enumerator.startswith("BTH"):
+            return "蓝牙"
+        if enumerator == "USB":
+            hint = f"{self.product} {self.manufacturer}".strip().lower()
+            if any(marker in hint for marker in WIRELESS_MARKERS):
+                return TRANSPORT_2G4
+            # A device that answers no string descriptor tells us nothing about
+            # the link; staying silent beats calling a receiver a cable.
+            return TRANSPORT_WIRED if hint else ""
+        return ""
 
     @property
     def is_system_reserved(self) -> bool:
@@ -468,6 +514,43 @@ def _read_value_caps(preparsed: int, report_type: int) -> tuple[ValueCap, ...]:
     return tuple(out)
 
 
+_ENUMERATOR_CACHE: dict[int, str] = {}
+
+
+def _enumerator_name(devinst: int) -> str:
+    """Return the enumerator of the first non-``HID`` ancestor of ``devinst``.
+
+    The HID top-level collections of a wireless receiver hang below
+    ``USB\\VID_...`` while Bluetooth HID collections hang below ``BTHENUM\\...``
+    or ``BTHLE\\...``.  Walking up the device tree is the only reliable way to
+    tell those apart, because both end up as ``HID\\VID_...`` nodes.
+    """
+    try:
+        devinst = int(devinst)
+    except (TypeError, ValueError):
+        return ""
+    if devinst in _ENUMERATOR_CACHE:
+        return _ENUMERATOR_CACHE[devinst]
+    name = ""
+    current = devinst
+    for _ in range(6):
+        buf = ctypes.create_unicode_buffer(512)
+        if cfgmgr32.CM_Get_Device_IDW(current, buf, 512, 0) != 0 or not buf.value:
+            break
+        prefix = buf.value.split("\\", 1)[0].upper()
+        if prefix and prefix != "HID":
+            name = prefix
+            break
+        parent = wintypes.DWORD(0)
+        if cfgmgr32.CM_Get_Parent(ctypes.byref(parent), current, 0) != 0 or not parent.value:
+            break
+        current = parent.value
+    if len(_ENUMERATOR_CACHE) > 512:
+        _ENUMERATOR_CACHE.clear()
+    _ENUMERATOR_CACHE[devinst] = name
+    return name
+
+
 def enumerate_hid() -> list[HidInterface]:
     """Enumerate all present HID top-level collections."""
     result: list[HidInterface] = []
@@ -528,6 +611,7 @@ def enumerate_hid() -> list[HidInterface]:
                 hdev, ctypes.byref(devinfo), iid_buf, 512, None
             ):
                 instance_id = iid_buf.value
+            enumerator = _enumerator_name(devinfo.DevInst)
 
             try:
                 item = _probe_interface(path)
@@ -535,6 +619,7 @@ def enumerate_hid() -> list[HidInterface]:
                 item = HidInterface(path=path, instance_id=instance_id, error=str(exc))
             if not item.instance_id:
                 item.instance_id = instance_id
+            item.enumerator = enumerator
             item.group_key = _group_key(path)
             if not item.group_key:
                 item.group_key = f"{item.vid:04X}:{item.pid:04X}"

@@ -20,6 +20,7 @@ from .config import (
 )
 from .debugui import DebugWindow
 from .hid import enumerate_hid
+from .icon import apply_icon
 from .installer import install, uninstall
 from .keyboard_watch import KeyboardWatcher
 from .panel import SURFACE_2, TEXT, PanelWindow
@@ -39,8 +40,7 @@ def _print_views(result: RefreshResult) -> None:
             print(f"{name}：未读取（{reason}）")
         else:
             charge = f"，{view.status_text}" if view.status_text else ""
-            stale = "（上次）" if view.stale else ""
-            print(f"{name}：{view.level}%{stale}{charge}  [{view.source}]")
+            print(f"{name}：{view.level}%{charge}  [{view.source}]")
     # Guarantee two lines even if settings are malformed and contain fewer devices.
     if len(result.views) < 2:
         print("第二台设备：未配置")
@@ -85,8 +85,17 @@ class Application:
         self._show_tray_icon = bool(self.settings.get("show_tray_icon", True))
         self._show_taskbar_strip = bool(self.settings.get("show_taskbar_strip", True))
         raw_devices = self.settings.get("tray_devices", ["mouse", "keyboard"])
-        wanted_devices = {str(item) for item in raw_devices} if isinstance(raw_devices, list) else set()
-        self._tray_devices = [kind for kind in ("mouse", "keyboard") if kind in wanted_devices]
+        self._tray_devices = (
+            [str(item) for item in raw_devices]
+            if isinstance(raw_devices, list)
+            else ["mouse", "keyboard"]
+        )
+        raw_strip = self.settings.get("taskbar_devices")
+        self._taskbar_devices = (
+            [str(item) for item in raw_strip]
+            if isinstance(raw_strip, list)
+            else list(self._tray_devices)
+        )
         self.service = BatteryService(self.settings)
         self.keyboard_watcher: KeyboardWatcher | None = KeyboardWatcher()
         self._last_watch_ts = 0.0
@@ -98,18 +107,20 @@ class Application:
         self.debug_window: DebugWindow | None = None
         self.views: list[DeviceView] = self.service.cached_views()
         self._refreshing = False
+        self._scanning = False
         self._closing = False
         self._startup_poll_id: str | None = None
         self._refresh_timer: str | None = None
         self._pump_id: str | None = None
         self._after_ids: list[str] = []
-        self._startup_hint = ""
         self._last_result: RefreshResult | None = None
 
         set_dpi_aware()
         self.root = tk.Tk()
         self.root.withdraw()
         self.root.title("电量托盘 Host")
+        # Every Toplevel (panel, debug window) inherits this icon.
+        apply_icon(self.root, make_default=True)
         self._configure_tk()
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
         self._apply_ttk_style()
@@ -123,9 +134,10 @@ class Application:
         if self._show_taskbar_strip:
             self._create_taskbar_strip()
         self._pump_id = self._schedule(100, self._pump)
-        self._schedule(150, self.request_refresh)
+        self._schedule(150, lambda: self.request_refresh(discover=True))
         self._schedule_refresh_timer()
         self._schedule(300, self._read_startup_state)
+        self._schedule(450, self._sync_pointers)
         self._schedule(3000, self._start_keyboard_watcher)
 
     def _start_keyboard_watcher(self) -> None:
@@ -191,7 +203,7 @@ class Application:
             self.tray_events,
             show_icons=self._show_tray_icon,
             strip_visible=self._show_taskbar_strip,
-            shown_kinds=self._tray_devices,
+            shown_ids=self._tray_devices,
         )
         if not self.tray.start_and_wait(5.0):
             error = self.tray.error or "未知错误"
@@ -210,17 +222,17 @@ class Application:
         if self._closing or self.taskbar_strip is not None:
             return
         try:
-            self.taskbar_strip = TaskbarStrip(self.root, self.open_panel, self._show_tray_menu)
+            self.taskbar_strip = TaskbarStrip(self.root, self._show_tray_menu)
             self.taskbar_strip.update(self._taskbar_views())
         except Exception as exc:
             self.taskbar_strip = None
             self._log(f"taskbar strip unavailable: {exc}")
 
     def _taskbar_views(self, views=None) -> list[DeviceView]:
-        """Only selected device cards appear in the taskbar strip."""
-        selected = set(self._tray_devices)
+        """Only devices with their own taskbar switch on appear in the strip."""
+        selected = set(self._taskbar_devices)
         source = self.views if views is None else views
-        return [v for v in source if getattr(v.target, "kind", "") in selected]
+        return [v for v in source if getattr(v.target, "id", "") in selected]
 
     def _show_tray_menu(self) -> None:
         if self.tray:
@@ -260,16 +272,27 @@ class Application:
             self.tray.set_menu_state(self._show_tray_icon, visible)
         self._sync_panel_visibility()
 
-    def _set_tray_devices(self, devices: list[str]) -> None:
-        wanted = {str(item) for item in devices}
-        self._tray_devices = [kind for kind in ("mouse", "keyboard") if kind in wanted]
-        self.settings["tray_devices"] = list(self._tray_devices)
+    def _set_device_surface(self, device_id: str, surface: str, enabled: bool) -> None:
+        """A card switch changed: one device on one surface (taskbar or tray)."""
+        target = self._taskbar_devices if surface == "taskbar" else self._tray_devices
+        if enabled:
+            if device_id not in target:
+                target.append(device_id)
+        elif device_id in target:
+            target.remove(device_id)
+        if surface == "taskbar":
+            self.settings["taskbar_devices"] = list(self._taskbar_devices)
+        else:
+            self.settings["tray_devices"] = list(self._tray_devices)
         try:
             save_settings(self.settings)
         except OSError as exc:
             self._log(f"save settings failed: {exc}")
         if self.tray:
-            self.tray.set_shown_kinds(self._tray_devices)
+            self.tray.set_shown_ids(self._tray_devices)
+            # Re-send the current readings so a freshly enabled icon has its
+            # real percentage and tooltip immediately, not after the refresh.
+            self.tray.update([self._tray_view(view) for view in self.views])
         if self.taskbar_strip:
             self.taskbar_strip.update(self._taskbar_views())
         self._sync_panel_visibility()
@@ -279,7 +302,7 @@ class Application:
             return
         try:
             self.panel.set_visibility_state(self._show_tray_icon, self._show_taskbar_strip)
-            self.panel.set_tray_devices(self._tray_devices)
+            self.panel.set_surfaces(self._taskbar_devices, self._tray_devices)
         except tk.TclError:
             pass
 
@@ -321,7 +344,7 @@ class Application:
             return
         if self.panel and self.panel.exists():
             self.panel.set_visibility_state(self._show_tray_icon, self._show_taskbar_strip)
-            self.panel.set_tray_devices(self._tray_devices)
+            self.panel.set_surfaces(self._taskbar_devices, self._tray_devices)
             self.panel.show()
             self._read_startup_state()
             self.request_refresh(manual=False)
@@ -332,18 +355,22 @@ class Application:
             tray_enabled=self.tray is not None and (self._show_tray_icon or self._show_taskbar_strip),
             refresh_seconds=int(self.settings.get("refresh_seconds", 60)),
             startup_enabled=bool(self._startup_state().get("enabled")),
-            startup_hint=self._startup_hint,
+            hide_to_tray=bool(self.settings.get("hide_to_tray", True)),
             tray_icon_visible=self._show_tray_icon,
             taskbar_visible=self._show_taskbar_strip,
+            taskbar_devices=self._taskbar_devices,
             tray_devices=self._tray_devices,
             on_refresh=lambda: self.request_refresh(manual=True),
             on_interval=self.on_interval,
             on_startup=self.on_startup_toggle,
             on_tray_icon=self._set_show_tray_icon,
             on_taskbar=self._set_show_taskbar_strip,
-            on_tray_devices=self._set_tray_devices,
+            on_device_surface=self._set_device_surface,
+            on_scan=self.scan_devices,
+            on_delete=self._delete_device,
             on_close=self.on_panel_close,
             on_quit=self.quit,
+            on_hide_pref=self._set_hide_to_tray,
         )
         self.panel.update_views(self.views, None)
         self.panel.show()
@@ -369,10 +396,19 @@ class Application:
                 pass
             self._startup_poll_id = self.root.after(3000, self._poll_startup_state)
 
+    def _set_hide_to_tray(self, enabled: bool) -> None:
+        """Remember whether the window's X button hides or closes the program."""
+        self.settings["hide_to_tray"] = bool(enabled)
+        try:
+            save_settings(self.settings)
+        except OSError as exc:
+            self._log(f"save settings failed: {exc}")
+
     def on_panel_close(self) -> None:
         if self._closing:
             return
-        if self.tray is not None and (self._show_tray_icon or self._show_taskbar_strip):
+        hide = bool(self.settings.get("hide_to_tray", True))
+        if hide and self.tray is not None and (self._show_tray_icon or self._show_taskbar_strip):
             self.panel.hide()
         else:
             self.quit()
@@ -385,25 +421,55 @@ class Application:
 
     def _read_startup_state(self) -> None:
         state = self._startup_state()
-        if not state.get("exists"):
-            hint = "启动文件夹未创建"
-        elif not state.get("enabled"):
-            hint = "任务管理器可见 · 已禁用"
-        elif not state.get("target_ok") or not state.get("args_ok"):
-            hint = "任务管理器可见 · 目标异常"
-        else:
-            hint = "任务管理器可见 · 已启用"
-        self._startup_hint = hint
         if self.panel:
-            self.panel.set_startup_state(bool(state.get("enabled")), hint)
+            self.panel.set_startup_state(bool(state.get("enabled")))
 
-    def on_startup_toggle(self, enabled: bool) -> None:
-        # This is only reached from a real user click.  The startup path never
-        # calls it, so a stale/disabled Task Manager state is never "corrected".
+    def _sync_pointers(self) -> None:
+        """Keep the portable launcher and its project pointer up to date.
+
+        The Startup/Desktop shortcuts point at ``%LOCALAPPDATA%\\电量托盘``, so a
+        moved project only needs ``location.json`` refreshed here; the shortcuts
+        themselves never go stale.
+        """
         try:
+            from .installer import sync_pointers
+
+            sync_pointers()
+        except Exception:
+            pass
+        self._migrate_startup()
+        self._read_startup_state()
+
+    def _migrate_startup(self) -> None:
+        """Rewrite a Startup entry created by an older, path-bound version.
+
+        Only shortcuts that already target pythonw.exe are touched, and only
+        while they are enabled, so a Task Manager "disabled" state is preserved.
+        """
+        state = self._startup_state()
+        if not (state.get("exists") and state.get("enabled") and state.get("target_ok")):
+            return
+        if state.get("args_ok") and state.get("path_ok"):
+            return
+        try:
+            from .installer import launcher_path
             from .shortcuts import set_startup_enabled
 
-            set_startup_enabled(bool(enabled), str(PROJECT_DIR), str(PROJECT_DIR / "my_devices.py"))
+            launcher = launcher_path()
+            set_startup_enabled(True, str(launcher.parent), str(launcher))
+        except Exception:
+            return
+
+    def on_startup_toggle(self, enabled: bool) -> None:
+        # User-initiated only: a disabled Task Manager entry is never re-enabled
+        # behind the user's back.  _migrate_startup() only fixes stale shortcuts.
+        try:
+            from .installer import launcher_path, sync_pointers
+            from .shortcuts import set_startup_enabled
+
+            sync_pointers()
+            launcher = launcher_path()
+            set_startup_enabled(bool(enabled), str(launcher.parent), str(launcher))
         except Exception as exc:
             messagebox.showerror("开机自启", f"更新启动文件夹失败：{exc}")
         self._read_startup_state()
@@ -453,15 +519,102 @@ class Application:
         self.request_refresh(manual=True)
 
     # ---- refresh --------------------------------------------------------
-    def request_refresh(self, manual: bool = False) -> None:
+    def request_refresh(self, manual: bool = False, discover: bool = False) -> None:
         if self._closing or self._refreshing:
             return
         if self.keyboard_watcher is not None and self.keyboard_watcher.is_alive():
             self.keyboard_watcher.nudge()
         self._refreshing = True
+        self._discover_next = bool(discover)
         if self.panel:
-            self.panel.set_status("正在读取设备…" if manual else "后台刷新中…")
+            self.panel.set_status("正在扫描设备…" if discover else ("正在读取设备…" if manual else "后台刷新中…"))
         threading.Thread(target=self._refresh_worker, name="battery-refresh", daemon=True).start()
+
+    def scan_devices(self) -> None:
+        """Look only for new devices; already known ones are not re-read."""
+        if self._closing or self._scanning:
+            return
+        self._scanning = True
+        if self.panel:
+            self.panel.set_status("正在扫描设备…")
+        threading.Thread(target=self._scan_worker, name="battery-scan", daemon=True).start()
+
+    def _scan_worker(self) -> None:
+        try:
+            found, views = self.service.scan_new()
+        except Exception as exc:
+            found, views = [], []
+            self._log(f"scan failed: {exc}")
+        self.queue.put(("scan", (found, views)))
+
+    def _handle_scan(self, payload) -> None:
+        found, views = payload
+        self._scanning = False
+        if found:
+            self._remember_discovered(found)
+            known = {view.target.id: index for index, view in enumerate(self.views)}
+            for view in views:
+                index = known.get(view.target.id)
+                if index is None:
+                    self.views.append(view)
+                else:
+                    self.views[index] = view
+        if self.panel and self.panel.exists():
+            self.panel.update_views(self.views, None)
+            self.panel.set_status(
+                f"发现 {len(found)} 台新设备" if found else "没有发现新设备"
+            )
+        if self.tray:
+            self.tray.update([self._tray_view(view) for view in self.views])
+        if self.taskbar_strip:
+            self.taskbar_strip.update(self._taskbar_views())
+
+    def _delete_device(self, device_id: str) -> None:
+        """Remove a device from the list (card, tray icon, taskbar cell)."""
+        if self._closing:
+            return
+        view = next((item for item in self.views if item.target.id == device_id), None)
+        if view is None:
+            return
+        name = view.target.name or device_id
+        if not messagebox.askyesno(
+            "删除设备",
+            f"确定删除「{name}」吗？\n\n删除后不再显示，之后可以用「扫描设备」重新添加。",
+            parent=getattr(self.panel, "win", None),
+        ):
+            return
+        self.service.remove_target(device_id)
+        self.settings["targets"] = [
+            item for item in self.settings.get("targets", [])
+            if str(item.get("id")) != device_id
+        ]
+        self.settings["discovered"] = [
+            item for item in self.settings.get("discovered", [])
+            if str(item.get("id")) != device_id
+        ]
+        removed_key = f"{view.target.vid:04X}:{view.target.pid:04X}"
+        removed = [str(item) for item in self.settings.get("removed", [])]
+        if removed_key not in removed:
+            removed.append(removed_key)
+        self.settings["removed"] = removed
+        self._taskbar_devices = [item for item in self._taskbar_devices if item != device_id]
+        self._tray_devices = [item for item in self._tray_devices if item != device_id]
+        self.settings["taskbar_devices"] = list(self._taskbar_devices)
+        self.settings["tray_devices"] = list(self._tray_devices)
+        try:
+            save_settings(self.settings)
+        except OSError as exc:
+            self._log(f"save settings failed: {exc}")
+        self.service.update_settings(self.settings)
+        self.views = [item for item in self.views if item.target.id != device_id]
+        if self.panel and self.panel.exists():
+            self.panel.update_views(self.views, None)
+            self.panel.set_status(f"已删除 {name}")
+        if self.tray:
+            self.tray.set_shown_ids(self._tray_devices)
+            self.tray.update([self._tray_view(item) for item in self.views])
+        if self.taskbar_strip:
+            self.taskbar_strip.update(self._taskbar_views())
 
     def _refresh_worker(self) -> None:
         try:
@@ -470,7 +623,14 @@ class Application:
                 if self.keyboard_watcher is not None and self.keyboard_watcher.is_alive()
                 else set()
             )
-            result = self.service.refresh(debug=self.debug, log=self._log, skip_kinds=skip)
+            discover = bool(getattr(self, "_discover_next", False))
+            self._discover_next = False
+            result = self.service.refresh(
+                debug=self.debug,
+                log=self._log,
+                skip_kinds=skip,
+                discover=discover,
+            )
         except Exception as exc:
             result = RefreshResult([], 0.0, f"刷新异常: {exc}")
         self.queue.put(("refresh", result))
@@ -479,6 +639,14 @@ class Application:
         self._refreshing = False
         self._last_result = result
         self.views = result.views
+        if result.discovered:
+            self._remember_discovered(result.discovered)
+        if result.settings_changed:
+            # A device kind was corrected from its HID collections.
+            try:
+                save_settings(self.settings)
+            except OSError as exc:
+                self._log(f"save settings failed: {exc}")
         if result.error:
             self._log(result.error)
         if self.panel and self.panel.exists():
@@ -495,6 +663,47 @@ class Application:
         if self.taskbar_strip:
             self.taskbar_strip.update(self._taskbar_views(result.views))
         self._schedule_refresh_timer()
+
+    def _remember_discovered(self, devices: list[dict]) -> None:
+        """Keep newly scanned devices in settings so their cards survive.
+
+        A new device starts with both surface switches off: it only gets a
+        card, and does not show up in the notification area or the taskbar
+        strip until the user turns its 任务栏 / 托盘 switch on.
+        """
+        known = {
+            str(item.get("id")): item
+            for item in self.settings.get("discovered", [])
+        }
+        changed = False
+        for device in devices:
+            device_id = str(device.get("id") or "")
+            if not device_id:
+                continue
+            existing = known.get(device_id)
+            if existing is None:
+                self.settings.setdefault("discovered", []).append(device)
+                known[device_id] = device
+                changed = True
+            else:
+                # Keep an older entry in step when the device now reports a
+                # different kind or name (the HID data is authoritative).
+                for field in ("kind", "name", "vid", "pid"):
+                    value = device.get(field)
+                    if value and existing.get(field) != value:
+                        existing[field] = value
+                        changed = True
+        self.settings["taskbar_devices"] = list(self._taskbar_devices)
+        self.settings["tray_devices"] = list(self._tray_devices)
+        if changed:
+            try:
+                save_settings(self.settings)
+            except OSError as exc:
+                self._log(f"save settings failed: {exc}")
+            if self.panel:
+                self.panel.set_surfaces(self._taskbar_devices, self._tray_devices)
+            if self.tray:
+                self.tray.set_shown_ids(self._tray_devices)
 
     # ---- automatic refresh ----------------------------------------------
     def _schedule_refresh_timer(self, delay_ms: int | None = None) -> None:
@@ -530,6 +739,8 @@ class Application:
                 break
             if kind == "refresh":
                 self._handle_refresh(payload)
+            elif kind == "scan":
+                self._handle_scan(payload)
         while True:
             try:
                 event = self.tray_events.get_nowait()
@@ -555,7 +766,7 @@ class Application:
         if self.debug:
             self._log(f"keyboard push: {reading.level}% source={reading.source}")
         for index, current in enumerate(self.views):
-            if current.target.kind == "keyboard":
+            if current.target.id == view.target.id:
                 self.views[index] = view
                 break
         else:

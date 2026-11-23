@@ -73,7 +73,6 @@ RIM_TYPEKEYBOARD = 1
 RI_KEY_BREAK = 0x01
 
 CLASS_NAME = "WirelessBatteryTrayWindow_v1"
-UID_KIND = {1: "mouse", 2: "keyboard"}
 MUTEX_NAME = "Local\\WirelessBatteryTray_v1"
 
 
@@ -258,12 +257,12 @@ class TrayView:
 class TrayThread(threading.Thread):
     def __init__(self, event_queue: queue.Queue,
                  show_icons: bool = True, strip_visible: bool = True,
-                 shown_kinds: list[str] | set[str] | None = None):
+                 shown_ids: list[str] | set[str] | None = None):
         super().__init__(name="battery-tray", daemon=True)
         self.events = event_queue
         self._icons_visible = bool(show_icons)
         self._strip_visible = bool(strip_visible)
-        self._shown_kinds = set(shown_kinds if shown_kinds is not None else UID_KIND.values())
+        self._shown_ids = {str(item) for item in (shown_ids or [])}
         self.hwnd: int = 0
         self.error = ""
         self._ready = threading.Event()
@@ -274,12 +273,16 @@ class TrayThread(threading.Thread):
         self._lock = threading.Lock()
         self._pending: list[TrayView] | None = None
         self._latest: list[TrayView] = []
-        self._icons: dict[int, int] = {1: 0, 2: 0}
+        self._icons: dict[int, int] = {}
         self._icons_added = False
-        self._icon_live: dict[int, bool] = {1: False, 2: False}
+        self._icon_live: dict[int, bool] = {}
         self._last: dict[int, tuple[str, int | None, str]] = {}
-        self._tooltips: dict[int, str] = {1: "无线鼠标：正在读取…", 2: "无线键盘：正在读取…"}
-        self._names: dict[int, str] = {1: "无线鼠标", 2: "无线键盘"}
+        self._tooltips: dict[int, str] = {}
+        self._names: dict[int, str] = {}
+        self._uid_by_id: dict[str, int] = {}
+        self._id_by_uid: dict[int, str] = {}
+        self._views_by_id: dict[str, TrayView] = {}
+        self._next_uid = 1
         self._last_key_event = 0.0
         self._raw_input_ok = False
         self._menu_open = False
@@ -310,10 +313,10 @@ class TrayThread(threading.Thread):
             self._icons_visible = bool(tray_visible)
             self._strip_visible = bool(strip_visible)
 
-    def set_shown_kinds(self, kinds: list[str] | set[str]) -> None:
+    def set_shown_ids(self, ids: list[str] | set[str]) -> None:
         """Choose which device icons are visible in the notification area."""
         with self._lock:
-            self._shown_kinds = {str(kind) for kind in kinds}
+            self._shown_ids = {str(item) for item in ids}
         if self.hwnd:
             user32.PostMessageW(self.hwnd, WM_APP_KINDS, 0, 0)
 
@@ -407,9 +410,19 @@ class TrayThread(threading.Thread):
         nid.uCallbackMessage = WM_APP_TRAY_CALLBACK
         return nid
 
+    def _uid(self, device_id: str) -> int:
+        """Stable shell icon id for a device id (allocated on first sight)."""
+        uid = self._uid_by_id.get(device_id)
+        if uid is None:
+            uid = self._next_uid
+            self._next_uid += 1
+            self._uid_by_id[device_id] = uid
+            self._id_by_uid[uid] = device_id
+        return uid
+
     def _icon_hidden(self, uid: int) -> bool:
         with self._lock:
-            return UID_KIND.get(uid, "") not in self._shown_kinds
+            return self._id_by_uid.get(uid, "") not in self._shown_ids
 
     def _set_icon_hidden(self, uid: int, hidden: bool) -> None:
         if not self._icon_live.get(uid):
@@ -421,43 +434,64 @@ class TrayThread(threading.Thread):
         shell32.Shell_NotifyIconW(NIM_MODIFY, __import__("ctypes").byref(nid))
 
     def _apply_kinds(self) -> None:
-        for uid in (1, 2):
+        with self._lock:
+            views = list(self._latest)
+        for view in views:
+            if not view.id:
+                continue
+            uid = self._uid(view.id)
+            if not self._icon_live.get(uid) and not self._icon_hidden(uid):
+                # The switch was just turned on: register the icon now.
+                self._add_icon(view)
+        for uid in list(self._id_by_uid):
             if self._icon_live.get(uid):
                 self._set_icon_hidden(uid, self._icon_hidden(uid))
+
+    def _add_icon(self, view: TrayView) -> None:
+        uid = self._uid(view.id)
+        if not self._icons.get(uid):
+            self._icons[uid] = icons.create_icon(view.level, view.kind or "device")
+        self._names.setdefault(uid, view.name or "外设")
+        self._tooltips.setdefault(uid, f"{view.name}：正在读取…")
+        nid = self._nid(uid)
+        nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP
+        nid.hIcon = self._icons[uid]
+        nid.szTip = self._tooltips[uid][:120]
+        ok = bool(shell32.Shell_NotifyIconW(NIM_ADD, __import__("ctypes").byref(nid)))
+        if not ok:
+            # Explorer may not be ready immediately after logon.
+            for _ in range(8):
+                time.sleep(0.15)
+                if shell32.Shell_NotifyIconW(NIM_ADD, __import__("ctypes").byref(nid)):
+                    ok = True
+                    break
+        if ok:
+            self._icons_added = True
+            self._icon_live[uid] = True
+            self._set_icon_hidden(uid, self._icon_hidden(uid))
+            version = self._nid(uid)
+            version.uFlags = 0
+            version.uTimeout = NOTIFYICON_VERSION_4
+            shell32.Shell_NotifyIconW(NIM_SETVERSION, __import__("ctypes").byref(version))
+        elif not self.error:
+            self.error = f"Shell_NotifyIconW(NIM_ADD) failed for icon {uid}"
 
     def _add_icons(self) -> None:
         if not self._icons_visible:
             return
-        for uid in (1, 2):
-            if not self._icons.get(uid):
-                self._icons[uid] = icons.create_icon(None, "mouse" if uid == 1 else "keyboard")
-            nid = self._nid(uid)
-            nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP
-            nid.hIcon = self._icons[uid]
-            nid.szTip = self._tooltips[uid][:120]
-            ok = bool(shell32.Shell_NotifyIconW(NIM_ADD, __import__("ctypes").byref(nid)))
-            if not ok:
-                # Explorer may not be ready immediately after logon.
-                for _ in range(8):
-                    time.sleep(0.15)
-                    if shell32.Shell_NotifyIconW(NIM_ADD, __import__("ctypes").byref(nid)):
-                        ok = True
-                        break
-            if ok:
-                self._icons_added = True
-                self._icon_live[uid] = True
-                self._set_icon_hidden(uid, self._icon_hidden(uid))
-                version = self._nid(uid)
-                version.uFlags = 0
-                version.uTimeout = NOTIFYICON_VERSION_4
-                shell32.Shell_NotifyIconW(NIM_SETVERSION, __import__("ctypes").byref(version))
-            elif not self.error:
-                self.error = f"Shell_NotifyIconW(NIM_ADD) failed for icon {uid}"
+        with self._lock:
+            views = list(self._latest)
+        for view in views:
+            if not view.id:
+                continue
+            if self._icon_hidden(self._uid(view.id)):
+                continue
+            self._add_icon(view)
 
     def _delete_icons(self) -> None:
         self._icons_added = False
-        self._icon_live = {1: False, 2: False}
-        for uid in (1, 2):
+        self._icon_live = {}
+        for uid in list(self._icons):
             if self.hwnd:
                 nid = self._nid(uid)
                 try:
@@ -489,11 +523,23 @@ class TrayThread(threading.Thread):
         with self._lock:
             views = self._pending
             self._pending = None
-        if not views or not self._icons_visible or not self._icons_added:
+        if not views or not self._icons_visible:
             return
-        for uid, view in zip((1, 2), views):
-            self._names[uid] = view.name or self._names[uid]
-            kind = view.kind or ("mouse" if uid == 1 else "keyboard")
+        for view in views:
+            if not view.id:
+                continue
+            uid = self._uid(view.id)
+            self._views_by_id[view.id] = view
+            if not self._icon_live.get(uid):
+                # A device whose 托盘 switch is off gets no icon at all; the
+                # switch can register one later (see _apply_kinds).
+                if self._icon_hidden(uid):
+                    continue
+                self._add_icon(view)
+            if not self._icon_live.get(uid):
+                continue
+            self._names[uid] = view.name or self._names.get(uid, "外设")
+            kind = view.kind or "device"
             percent = "--" if view.level is None else f"{view.level}%"
             when = view.updated_text or "尚未读取"
             tooltip = f"{self._names[uid]}：{percent}（{when}）"
@@ -504,8 +550,14 @@ class TrayThread(threading.Thread):
             nid = self._nid(uid)
             nid.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP
             old_icon = self._icons.get(uid)
+            previous = self._last.get(uid)
             new_icon = None
-            if not old_icon or self._last.get(uid, (None, None, None))[1] != view.level:
+            if (
+                not old_icon
+                or previous is None
+                or previous[1] != view.level
+                or previous[3] != kind
+            ):
                 new_icon = icons.create_icon(view.level, kind)
                 nid.hIcon = new_icon or old_icon
             else:
@@ -520,6 +572,7 @@ class TrayThread(threading.Thread):
                 else:
                     icons.destroy_icon(new_icon)
             self._last[uid] = key
+        self._icons_added = any(self._icon_live.values())
 
     def _register_raw_keyboard(self) -> None:
         """Ask for keyboard input even while our window is not foreground."""
@@ -706,8 +759,8 @@ class TrayThread(threading.Thread):
                 # Explorer restarted: icons were lost with the old taskbar.
                 for icon in self._icons.values():
                     icons.destroy_icon(icon)
-                self._icons = {1: 0, 2: 0}
-                self._icon_live = {1: False, 2: False}
+                self._icons = {}
+                self._icon_live = {}
                 self._last.clear()
                 if self._icons_visible:
                     self._add_icons()
